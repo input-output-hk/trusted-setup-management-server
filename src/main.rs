@@ -1,23 +1,22 @@
 use actix_files::Files;
+use actix_web::{get, App, HttpResponse, HttpServer, Responder};
+use futures_util::StreamExt;
 use parking_lot::RwLock;
-use actix_web::{
-    get, App, HttpResponse, HttpServer, Responder
-};
+use rand::{rng, Rng};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, ReadDir};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use futures_util::StreamExt;
-use reqwest::Client;
-use sha2::{Sha256, Digest};
-use std::io::{BufWriter, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
-use rand::{rng, Rng};
-use serde::{Deserialize, Serialize};
 
 static CURR_STEP: RwLock<SrsSteps> = RwLock::new(SrsSteps::Idle);
 static ERROR: RwLock<String> = RwLock::new(String::new());
-static SRS_RESULT: LazyLock<RwLock<SRSResult>> = LazyLock::new(|| RwLock::new(SRSResult::default()));
+static SRS_RESULT: LazyLock<RwLock<SRSResult>> =
+    LazyLock::new(|| RwLock::new(SRSResult::default()));
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SRSResult {
@@ -59,8 +58,7 @@ pub fn hexdump(bytes: &[u8], pretty_print: bool) -> String {
             }
             retval.push_str(&format!("{:02x} ", byte));
             retval.push('\n');
-        } 
-        else {
+        } else {
             retval.push_str(&format!("{byte:02x}"));
         }
     }
@@ -95,33 +93,37 @@ pub fn compute_sha256(path: &PathBuf) -> [u8; 32] {
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = Vec::new();
 
-    reader.read_to_end(&mut buffer).expect("Could not read file");
+    reader
+        .read_to_end(&mut buffer)
+        .expect("Could not read file");
     hasher.update(&buffer);
     hasher.finalize().into()
 }
 
-async fn run_srs_utils(sha_srs: String, srs_path: &PathBuf, proof_path: &PathBuf) -> Result<SRSResult, Box<dyn std::error::Error + Send + Sync>> {
+async fn run_srs_utils(
+    sha_srs: String,
+    srs_path: &PathBuf,
+    proof_path: &PathBuf,
+) -> Result<SRSResult, Box<dyn std::error::Error + Send + Sync>> {
     let random_string = generate_random_entropy(32);
 
     let mut child = Command::new("./srs_utils")
         .arg("./powers_of_tau")
         .arg("update")
+        .arg(random_string)
+        // RDRAND in TEE.
+        .arg("true")
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(random_string.as_bytes())?;
-    }
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all("Y".as_bytes())?;
-    }
-
     let result = child.wait()?;
     if !result.success() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("SRS Utils command failed with status: {}", result))));
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("SRS Utils command failed with status: {}", result),
+        )));
     }
 
     println!("Getting hashes of the SRS and proof files...");
@@ -136,9 +138,15 @@ async fn run_srs_utils(sha_srs: String, srs_path: &PathBuf, proof_path: &PathBuf
     println!("Both hashes: {:x?}", both_hashes);
     println!("Writing hashes to file...");
 
-    let mut file_hash = BufWriter::new(File::create("./proof_hash.bin").expect("Could not create proof_hash.bin file"));
-    file_hash.write_all(&both_hashes).expect("Could not write to proof_hash.bin file");
-    file_hash.flush().expect("Could not flush proof_hash.bin file");
+    let mut file_hash = BufWriter::new(
+        File::create("./proof_hash.bin").expect("Could not create proof_hash.bin file"),
+    );
+    file_hash
+        .write_all(&both_hashes)
+        .expect("Could not write to proof_hash.bin file");
+    file_hash
+        .flush()
+        .expect("Could not flush proof_hash.bin file");
 
     println!("Hashes of the SRS and proof files have been successfully written to proof_hash.bin!");
 
@@ -157,13 +165,13 @@ async fn run_srs_utils(sha_srs: String, srs_path: &PathBuf, proof_path: &PathBuf
     match result {
         Ok(status) if status.success() => {
             println!("AMD-SEV-SNP attestation has been successfully generated and saved to attestation.txt!");
-        },
+        }
         Ok(status) => {
             eprintln!("AttestationClient failed with exit code: {}", status);
-        },
+        }
         Err(err) => {
             eprintln!("AttestationClient failed with error: {:?}", err);
-        },
+        }
     }
     let attestation_file = std::fs::read_to_string("attestation.txt")?;
     let srs_hash = hexdump(&both_hashes[..32], false);
@@ -193,7 +201,7 @@ async fn download_power_of_tau() -> Result<String, Box<dyn std::error::Error + S
     let mut file = std::fs::File::create("powers_of_tau")?;
     let mut hasher = Sha256::new();
     let mut stream = resp.bytes_stream();
-    
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         hasher.update(&chunk);
@@ -204,7 +212,9 @@ async fn download_power_of_tau() -> Result<String, Box<dyn std::error::Error + S
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn dump_srs_result_to_file(srs_res: SRSResult) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn dump_srs_result_to_file(
+    srs_res: SRSResult,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut result = SRS_RESULT.write();
     *result = srs_res.clone();
     drop(result);
@@ -213,13 +223,28 @@ fn dump_srs_result_to_file(srs_res: SRSResult) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn move_artifacts(srs_path: PathBuf, proof_path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let srs_name = srs_path.file_name().and_then(|n| n.to_str()).ok_or("Invalid SRS path")?;
-    let proof_name = proof_path.file_name().and_then(|n| n.to_str()).ok_or("Invalid proof path")?;
-    
+fn move_artifacts(
+    srs_path: PathBuf,
+    proof_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let srs_name = srs_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid SRS path")?;
+    let proof_name = proof_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid proof path")?;
+
     std::fs::rename("./powers_of_tau", "./artifacts/powers_of_tau")?;
-    std::fs::rename(format!("./{}", srs_name), format!("./artifacts/{}", srs_name))?;
-    std::fs::copy(format!("./proofs/{}", proof_name), format!("./artifacts/{}", proof_name))?;
+    std::fs::rename(
+        format!("./{}", srs_name),
+        format!("./artifacts/{}", srs_name),
+    )?;
+    std::fs::copy(
+        format!("./proofs/{}", proof_name),
+        format!("./artifacts/{}", proof_name),
+    )?;
     Ok(())
 }
 
@@ -233,7 +258,11 @@ async fn health() -> impl Responder {
     let step = CURR_STEP.read();
     if *step == SrsSteps::Error {
         let error_message = ERROR.read();
-        return HttpResponse::InternalServerError().body(format!("Current step: {}. Error message: {}", step.to_string(), *error_message));
+        return HttpResponse::InternalServerError().body(format!(
+            "Current step: {}. Error message: {}",
+            step.to_string(),
+            *error_message
+        ));
     }
     let health_status = format!("Current step: {}", step.to_string());
     HttpResponse::Ok().body(health_status)
@@ -296,7 +325,10 @@ async fn calculate() -> impl Responder {
         });
         return HttpResponse::Ok().body("Calculation started.");
     } else if *step < SrsSteps::Done {
-        return HttpResponse::BadRequest().body(format!("A process is already ongoing. Current step: {}", step.to_string()));
+        return HttpResponse::BadRequest().body(format!(
+            "A process is already ongoing. Current step: {}",
+            step.to_string()
+        ));
     } else {
         return HttpResponse::Ok().json(SRS_RESULT.read().clone());
     }
@@ -311,10 +343,13 @@ async fn run_attestation_test() -> Result<String, Box<dyn std::error::Error + Se
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
-    
+
     let result = child.wait()?;
     if !result.success() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Attestation command failed with status: {}", result))));
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Attestation command failed with status: {}", result),
+        )));
     }
     let attestation_file = std::fs::read_to_string("attestation_test.txt")?;
     Ok(attestation_file)
@@ -329,7 +364,8 @@ async fn test_attestation() -> impl Responder {
         Err(e) => {
             let mut error = ERROR.write();
             *error = format!("Error during attestation test: {}", e);
-            return HttpResponse::InternalServerError().body(format!("Attestation test failed: {}", e));
+            return HttpResponse::InternalServerError()
+                .body(format!("Attestation test failed: {}", e));
         }
     }
 }
@@ -362,7 +398,9 @@ fn init_srv() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let srs_res: SRSResult = bincode::deserialize(&serialized_srs)?;
         *SRS_RESULT.write() = srs_res;
         *CURR_STEP.write() = SrsSteps::Done;
-        println!("Restored SRS results. Setting current step to Done, preventing further calculations.");
+        println!(
+            "Restored SRS results. Setting current step to Done, preventing further calculations."
+        );
     } else {
         println!("srs_result.bin not found, starting with an empty state.");
     }
